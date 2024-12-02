@@ -1,0 +1,1 @@
+# socketio-redis-adapter
