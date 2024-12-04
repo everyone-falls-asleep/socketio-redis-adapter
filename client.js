@@ -16,17 +16,17 @@ const socket = io(SERVER_URL, {
 });
 
 socket.on("connect", () => {
+  console.log(`Connected to server with ID: ${socket.id}`);
+
+  socket.emit("publish-message", "test");
+
   socket.on("error", (error) => {
     console.error("Error:", error.message);
   });
 });
 
-socket.on("user-joined", (data) => {
-  console.log(data.message);
-});
-
-socket.on("user-left", (data) => {
-  console.log(data.message);
+socket.on("new-message", (data) => {
+  console.log(`New message from ${data.id}: ${data.message}`);
 });
 
 socket.on("disconnect", () => {

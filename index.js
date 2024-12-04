@@ -53,54 +53,52 @@ const io = new Server(fastify.server, {
   adapter: createAdapter(pubClient, subClient),
 });
 
-const GLOBAL_ROOM = "global-room";
+const REDIS_CHANNEL = "chat-messages";
+
+subClient.subscribe(REDIS_CHANNEL, (err) => {
+  if (err) {
+    console.error(
+      `Failed to subscribe to Redis channel '${REDIS_CHANNEL}':`,
+      err
+    );
+  } else {
+    console.log(`Subscribed to Redis channel: ${REDIS_CHANNEL}`);
+  }
+});
 
 io.on("connection", (socket) => {
-  // Log when a new client connects
   console.log(`New client connected: ${socket.id}`);
 
-  // Automatically join the global room
-  socket.join(GLOBAL_ROOM);
+  pubClient.publish(
+    REDIS_CHANNEL,
+    JSON.stringify({
+      id: socket.id,
+      message: `New client connected: ${socket.id}`,
+    })
+  );
 
-  // Notify other clients in GLOBAL_ROOM about the new connection
-  socket.to(GLOBAL_ROOM).emit("user-joined", {
-    id: socket.id,
-    message: `User ${socket.id} has joined the ${GLOBAL_ROOM}`,
-  });
+  const onMessage = (channel, message) => {
+    if (channel === REDIS_CHANNEL) {
+      console.log(`Received message from ${REDIS_CHANNEL}:`, message);
+      io.emit("new-message", JSON.parse(message));
+    }
+  };
+  subClient.on("message", onMessage);
 
   socket.on("disconnect", async () => {
     console.log(`Client disconnected: ${socket.id}`);
-    // Notify other clients in GLOBAL_ROOM about the disconnection
-    socket.to(GLOBAL_ROOM).emit("user-left", {
-      id: socket.id,
-      message: `User ${socket.id} has left the ${GLOBAL_ROOM}`,
-    });
+
+    pubClient.publish(
+      REDIS_CHANNEL,
+      JSON.stringify({
+        id: socket.id,
+        message: `Client disconnected: ${socket.id}`,
+      })
+    );
+
+    subClient.removeListener("message", onMessage);
+    console.log(`Unsubscribed from ${REDIS_CHANNEL} for client: ${socket.id}`);
   });
-});
-
-io.of("/").adapter.on("join-room", (room, id) => {
-  if (room != id) {
-    console.log(`Socket ${id} has joined room ${room}`);
-    // Broadcast the event to all nodes
-    io.serverSideEmit("join-room", { room, id });
-  }
-});
-
-io.of("/").adapter.on("leave-room", (room, id) => {
-  if (room != id) {
-    console.log(`Socket ${id} has left room ${room}`);
-    // Broadcast the event to all nodes
-    io.serverSideEmit("leave-room", { room, id });
-  }
-});
-
-// Handle server-side emitted events
-io.on("join-room", ({ room, id }) => {
-  console.log(`Socket ${id} has joined room ${room}`);
-});
-
-io.on("leave-room", ({ room, id }) => {
-  console.log(`Socket ${id} has left room ${room}`);
 });
 
 const startServer = async () => {
@@ -140,6 +138,8 @@ async function gracefulShutdown(signal) {
 
     await fastify.close();
     fastify.log.info("Fastify server has been closed.");
+
+    await Promise.all([pubClient.quit(), subClient.quit()]);
 
     // 기타 필요한 종료 작업 (예: DB 연결 해제)
     // await database.disconnect();
