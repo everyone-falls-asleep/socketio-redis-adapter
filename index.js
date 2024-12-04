@@ -53,51 +53,115 @@ const io = new Server(fastify.server, {
   adapter: createAdapter(pubClient, subClient),
 });
 
-const REDIS_CHANNEL = "chat-messages";
+const STREAM_KEY = "chat-messages";
+const CONSUMER_GROUP = "chat-group";
+const CONSUMER_NAME = `consumer-${process.pid}`; // Unique consumer name per instance
 
-subClient.subscribe(REDIS_CHANNEL, (err) => {
-  if (err) {
-    console.error(
-      `Failed to subscribe to Redis channel '${REDIS_CHANNEL}':`,
-      err
+// Initialize the consumer group
+async function initializeStream() {
+  try {
+    // Create consumer group if it doesn't exist
+    await fastify.redis.xgroup(
+      "CREATE",
+      STREAM_KEY,
+      CONSUMER_GROUP,
+      "0",
+      "MKSTREAM"
     );
-  } else {
-    console.log(`Subscribed to Redis channel: ${REDIS_CHANNEL}`);
+    fastify.log.info(
+      `Consumer group '${CONSUMER_GROUP}' created or already exists.`
+    );
+  } catch (err) {
+    if (err.message.includes("BUSYGROUP")) {
+      fastify.log.info(`Consumer group '${CONSUMER_GROUP}' already exists.`);
+    } else {
+      fastify.log.error("Error creating consumer group:", err);
+      process.exit(1);
+    }
   }
-});
+}
+
+// Function to read messages from the stream
+async function consumeStream() {
+  while (true) {
+    try {
+      const response = await fastify.redis.xreadgroup(
+        "GROUP",
+        CONSUMER_GROUP,
+        CONSUMER_NAME,
+        "COUNT",
+        10,
+        "BLOCK",
+        5000, // 5 seconds
+        "STREAMS",
+        STREAM_KEY,
+        ">"
+      );
+
+      if (response) {
+        const [stream, messages] = response[0];
+        for (const [id, fields] of messages) {
+          const message = {};
+          for (let i = 0; i < fields.length; i += 2) {
+            message[fields[i]] = fields[i + 1];
+          }
+          fastify.log.info(`Processing message ID ${id}:`, message);
+          io.emit("new-message", message);
+
+          // Acknowledge the message
+          await fastify.redis.xack(STREAM_KEY, CONSUMER_GROUP, id);
+        }
+      }
+    } catch (err) {
+      fastify.log.error("Error consuming stream:", err);
+      // Optional: Implement retry logic or exit
+    }
+  }
+}
+
+// Start consuming the stream
+await initializeStream();
+consumeStream(); // Note: Not awaiting to allow it to run concurrently
 
 io.on("connection", (socket) => {
   console.log(`New client connected: ${socket.id}`);
 
-  pubClient.publish(
-    REDIS_CHANNEL,
-    JSON.stringify({
-      id: socket.id,
-      message: `New client connected: ${socket.id}`,
-    })
-  );
-
-  const onMessage = (channel, message) => {
-    if (channel === REDIS_CHANNEL) {
-      console.log(`Received message from ${REDIS_CHANNEL}:`, message);
-      io.emit("new-message", JSON.parse(message));
-    }
+  // Notify others that a new client has connected
+  const connectMessage = {
+    id: socket.id,
+    message: `New client connected: ${socket.id}`,
+    timestamp: new Date().toISOString(),
   };
-  subClient.on("message", onMessage);
+  fastify.redis.xadd(
+    STREAM_KEY,
+    "*",
+    "id",
+    connectMessage.id,
+    "message",
+    connectMessage.message,
+    "timestamp",
+    connectMessage.timestamp
+  );
 
   socket.on("disconnect", async () => {
     console.log(`Client disconnected: ${socket.id}`);
 
-    pubClient.publish(
-      REDIS_CHANNEL,
-      JSON.stringify({
-        id: socket.id,
-        message: `Client disconnected: ${socket.id}`,
-      })
+    // Notify others that a client has disconnected
+    const disconnectMessage = {
+      id: socket.id,
+      message: `Client disconnected: ${socket.id}`,
+      timestamp: new Date().toISOString(),
+    };
+    await fastify.redis.xadd(
+      STREAM_KEY,
+      "*",
+      "id",
+      disconnectMessage.id,
+      "message",
+      disconnectMessage.message,
+      "timestamp",
+      disconnectMessage.timestamp
     );
-
-    subClient.removeListener("message", onMessage);
-    console.log(`Unsubscribed from ${REDIS_CHANNEL} for client: ${socket.id}`);
   });
 });
 
